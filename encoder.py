@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image
+import imageio.v3 as io
 
 from typing import Optional, Union, Literal, Dict, Tuple, List
 from collections import defaultdict
@@ -98,6 +98,7 @@ class PreprocessedImage:
     max_h: int
     mcu_h: int
     mcu_w: int
+    precision: int
 
 class BitWriter:
     def __init__(self):
@@ -133,7 +134,7 @@ class BitWriter:
         return bytes(self.out)
 
 # Process image
-def normalizeImage(im):
+def normalizeImage(im, precision):
     arr = np.asarray(im)
 
     if arr.ndim == 2:
@@ -141,13 +142,13 @@ def normalizeImage(im):
     elif arr.ndim == 3 and arr.shape[2] >= 3:   # RGBA
         arr = arr[:, :, :3]
 
-    if arr.dtype != np.uint8:
-        if np.issubdtype(arr.dtype, np.floating):
-            arr = arr * 255.0 if np.max(arr) <= 1 else arr
-        arr = np.clip(np.rint(arr), 0, 255).astype(np.uint8)
-    return arr
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = arr * ((1 << precision) - 1) if np.max(arr) <= 1 else arr
+    elif precision == 12 and arr.dtype == np.uint8:
+        arr = arr.astype(np.float64) * 4095 / 255
+    return np.clip(np.rint(arr), 0, (1 << precision) - 1).astype(np.uint8 if precision == 8 else np.uint16)
 
-def RGB2YCbCr(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def RGB2YCbCr(rgb: np.ndarray, precision: int = 8) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     RGB to YCbCr conversion
     Four decimal position accuracy
@@ -156,8 +157,8 @@ def RGB2YCbCr(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     x = rgb.astype(np.float64)
     r, g, b = x[:, :, 0], x[:, :, 1], x[:, :, 2]
     y = 0.299 * r + 0.587 * g + 0.114 * b
-    cb = -0.1687 * r - 0.3313 * g + 0.5 * b + 128
-    cr = 0.5 * r - 0.4187 * g - 0.0813 * b + 128
+    cb = -0.1687 * r - 0.3313 * g + 0.5 * b + (1 << (precision - 1))
+    cr = 0.5 * r - 0.4187 * g - 0.0813 * b + (1 << (precision - 1))
     return y, cb, cr
 
 def getTargetSize(n: int, m: int) -> int:
@@ -179,28 +180,29 @@ def downsample(plane, factor_y, factor_x):
 
 def preprocessImage(im,
                     quality: int,
-                    subsampling: Subsampling) -> PreprocessedImage:
-    arr = normalizeImage(im)
+                    subsampling: Subsampling,
+                    precision: int) -> PreprocessedImage:
+    arr = normalizeImage(im, precision)
     h0, w0 = arr.shape[:2]
     if h0 == 0 or w0 == 0:
         raise ValueError("Invalid image input")
     if h0 > 65535 or w0 > 65535:
         raise ValueError("Invalid image dimensions")
 
-    qtableY = generateQuantTable(LUMA_QUANT_TABLE, quality)
-    qtableC = generateQuantTable(CHROMA_QUANT_TABLE, quality)
+    qtableY = generateQuantTable(LUMA_QUANT_TABLE, quality, precision)
+    qtableC = generateQuantTable(CHROMA_QUANT_TABLE, quality, precision)
 
     if arr.ndim == 2 or subsampling == "gray":
-        y = arr if arr.ndim == 2 else RGB2YCbCr(arr)[0]
+        y = arr if arr.ndim == 2 else RGB2YCbCr(arr, precision)[0]
         target_h, target_w = getTargetSize(h0, 8), getTargetSize(w0, 8)
         components = [Component(1, "Y", 1, 1, 0, 0, 0)]
         planes = {"Y": padEdge(y, target_h, target_w)}
-        return PreprocessedImage(h0, w0, "gray", components, planes, {0: qtableY}, 1, 1, 8, 8)
+        return PreprocessedImage(h0, w0, "gray", components, planes, {0: qtableY}, 1, 1, 8, 8, precision)
 
     if subsampling not in ("444", "422", "420"):
         raise ValueError("Invalid subsampling pattern")
 
-    y, cb, cr = RGB2YCbCr(arr)
+    y, cb, cr = RGB2YCbCr(arr, precision)
 
     if subsampling == "444":
         v_samplingFactor, h_samplingFactor = 1, 1
@@ -229,7 +231,7 @@ def preprocessImage(im,
             Component(3, "Cr", 1, 1, 1, 1, 1)
             ]
     planes = {"Y": y_pad, "Cb": cb_ds, "Cr": cr_ds}
-    return PreprocessedImage(h0, w0, subsampling, components, planes, {0: qtableY, 1: qtableC}, v_samplingFactor, h_samplingFactor, mcu_h, mcu_w)
+    return PreprocessedImage(h0, w0, subsampling, components, planes, {0: qtableY, 1: qtableC}, v_samplingFactor, h_samplingFactor, mcu_h, mcu_w, precision)
 
 # DCT & Quantization
 def generateDCT():
@@ -246,17 +248,17 @@ def generateDCT():
 DCT = generateDCT()
 DCT_T = DCT.T
 
-def generateQuantTable(base: np.ndarray, quality: int) -> np.ndarray:
+def generateQuantTable(base: np.ndarray, quality: int, precision: int = 8) -> np.ndarray:
     """
     libjpeg
     """
     if quality < 1: quality = 1
     if quality > 100: quality = 100
     scale = 5000 / quality if quality < 50 else 200 - 2 * quality
-    return np.clip(np.rint((base.astype(np.float64) * scale + 50) / 100).astype(np.int32), 1, 255)
+    return np.clip(np.rint((base.astype(np.float64) * scale + 50) / 100).astype(np.int32), 1, (1 << precision) - 1)
 
-def quantizeBlock(block, qtable):
-    shifted = block.astype(np.float64) - 128
+def quantizeBlock(block, qtable, precision: int = 8):
+    shifted = block.astype(np.float64) - (1 << (precision - 1))
     coeff = np.rint(DCT @ shifted @ DCT_T / qtable).astype(np.int32)
     return coeff.ravel()[ZIGZAG]
 
@@ -279,13 +281,13 @@ def buildSymbolMap(bits, values):
         code <<= 1
     return map
 
-def countSymbols(image, qtables):
+def countSymbols(image, qtables, precision):
     dc_freq = defaultdict(lambda: defaultdict(int))
     ac_freq = defaultdict(lambda: defaultdict(int))
     pred = {c.name: 0 for c in image.components}
 
     for c, block in getMCUs(image):
-        zigzag = quantizeBlock(block, qtables[c.qid])
+        zigzag = quantizeBlock(block, qtables[c.qid], precision)
 
         # DC
         dc = int(zigzag[0])
@@ -398,6 +400,7 @@ def category(value: int) -> int:
     return 0 if t == 0 else t.bit_length()
 
 def getEntropyData(image, lookup,
+                   precision: int = 8,
                    Ss: int = 0,
                    Se: int = 63,
                    components: Optional[List[str]] = None):
@@ -417,11 +420,11 @@ def getEntropyData(image, lookup,
         pred = {c: 0 for c in components}
         for c, block in iter:
             pred[c.name] = encodeBlock(block, image.qtables[c.qid], pred[c.name],
-                                       c.dcid, c.acid, bw, lookup, Ss, Se)
+                                       c.dcid, c.acid, bw, lookup, precision, Ss, Se)
     else:
         for c, block in iter:
             encodeBlock(block, image.qtables[c.qid], None,
-                        None, c.acid, bw, lookup, Ss, Se)
+                        None, c.acid, bw, lookup, precision, Ss, Se)
     return bw.flush()
 
 def getMCUs(image, component: Optional[str]=None):
@@ -454,9 +457,10 @@ def encodeBlock(block,
                 ac_table_id: int,
                 bw: BitWriter,
                 lookup,
+                precision,
                 Ss: int,
                 Se: int):
-    zigzag = quantizeBlock(block, qtable)
+    zigzag = quantizeBlock(block, qtable, precision)
 
     # DC
     if Ss == 0:
@@ -511,19 +515,26 @@ def getAPP0_JFIF():
     payload = (b"JFIF\x00" + bytes([1, 1]) + bytes([0]) + u16_BE(1) + u16_BE(1) + bytes([0, 0]))
     return buildMarker(0xE0, payload)
 
-def getDQT(qtables):
+def getDQT(qtables, precision: int = 8):
+    # [T.81] - Table B.4
     payload = bytearray()
+    Pq = 0 if precision == 8 else 1
     for i in qtables:
-        payload.append(i & 0x0F)    # Lossy
-        payload.extend(int(a) & 0xFF for a in qtables[i].ravel()[ZIGZAG])
+        payload.append((Pq << 4) | (i & 0x0F))    # Lossy
+        if Pq == 0:
+            for a in qtables[i].ravel()[ZIGZAG]:
+                payload.append(int(a) & 0xFF)
+        else:
+            for a in qtables[i].ravel()[ZIGZAG]:
+                payload.extend(u16_BE(int(a) & 0xFFFF))
     return buildMarker(0xDB, bytes(payload))
 
-def getSOF(image: PreprocessedImage, n: int):
+def getSOF(image: PreprocessedImage, n: int, precision: int = 8):
     # [T.81] - Table B.2
     if n < 0 or n > 15:
         raise ValueError("Invalid frame marker")
     payload = bytearray()
-    payload.append(8)
+    payload.append(precision)
     payload.extend(u16_BE(image.height))
     payload.extend(u16_BE(image.width))
     payload.append(len(image.components))
@@ -543,8 +554,9 @@ def getHuffmanTables(tables: Dict, color: bool):
     return bytes(out)
 
 def  _getHuffmanTable(c, id, bits, values):
+    # [T.81] - Table B.5
     payload = bytearray()
-    payload.append(((c & 0x0F) << 4) | (id & 0x0F))     # [T.81] - Table B.5
+    payload.append(((c & 0x0F) << 4) | (id & 0x0F))
     payload.extend(x & 0xFF for x in bits)
     payload.extend(x & 0xFF for x in values)
     return buildMarker(0xC4, bytes(payload))
@@ -552,9 +564,7 @@ def  _getHuffmanTable(c, id, bits, values):
 def getScanHeader(components: List[Component],
                   Ss: int = 0, Se: int = 63,
                   Ah: int = 0, Al: int = 0):
-    """
-    [T.81] - Table B.3
-    """
+    # [T.81] - Table B.3
     payload = bytearray()
     payload.append(len(components))
     for c in components:
@@ -572,33 +582,39 @@ def getScanHeader(components: List[Component],
 def encodeOutput(im: PreprocessedImage,
                  lookup: Dict,
                  tables: Dict,
-                 mode: int) -> bytes:
+                 mode: int,
+                 precision: int) -> bytes:
     out = bytearray()
     components = im.components
 
     out.extend(buildMarker(0xD8))       # SOI - FFD8
     out.extend(getAPP0_JFIF())          # [T.871] - 6.3
-    out.extend(getDQT(im.qtables))
-
+    out.extend(getDQT(im.qtables, precision if mode else 8))
     out.extend(getHuffmanTables(tables, color=len(components) == 3))
+
     if mode == 0:       # Baseline
         out.extend(getSOF(im, 0))
         out.extend(getScanHeader(components))
         out.extend(getEntropyData(im, lookup))
 
+    elif mode == 1:     # Extended
+        out.extend(getSOF(im, 1, precision))
+        out.extend(getScanHeader(components))
+        out.extend(getEntropyData(im, lookup, precision))
+
     elif mode == 2:     # Progressive
-        out.extend(getSOF(im, 2))
+        out.extend(getSOF(im, 2, precision))
         # DC
         out.extend(getScanHeader(components, 0, 0))
-        out.extend(getEntropyData(im, lookup, 0, 0))
+        out.extend(getEntropyData(im, lookup, precision, 0, 0))
         # AC
         out.extend(getScanHeader([components[0]], 1, 2))
-        out.extend(getEntropyData(im, lookup, 1, 2, [components[0].name]))
+        out.extend(getEntropyData(im, lookup, precision, 1, 2, [components[0].name]))
         out.extend(getScanHeader([components[0]], 3, 63))
-        out.extend(getEntropyData(im, lookup, 3, 63, [components[0].name]))
+        out.extend(getEntropyData(im, lookup, precision, 3, 63, [components[0].name]))
         for c in components[1:]:
             out.extend(getScanHeader([c], 1, 63))
-            out.extend(getEntropyData(im, lookup, 1, 63, [c.name]))
+            out.extend(getEntropyData(im, lookup, precision, 1, 63, [c.name]))
     else:
         raise ValueError("Unsupported operation mode")
 
@@ -607,30 +623,25 @@ def encodeOutput(im: PreprocessedImage,
 
 def writeOutput(im,
                 output: Union[str, Path],
-                quality: int = 75,
+                quality: int = 50,
                 subsampling: Subsampling = "420",
                 adaptive: bool = False,
-                mode: int = 0) -> None:
-    p = preprocessImage(im, quality, subsampling)
+                mode: int = 0,
+                precision: int = 8) -> None:
+    p = preprocessImage(im, quality, subsampling, precision if mode else 8)
 
     if adaptive:
-        rawTables = buildAdaptiveTables(countSymbols(p, p.qtables))
+        rawTables = buildAdaptiveTables(countSymbols(p, p.qtables, precision))
     else:
         rawTables = {(0, 0): (LUMA_DC_BITS, DC_VAL),    # (coeff, channel)
                      (1, 0): (LUMA_AC_BITS, LUMA_AC_VAL),
                      (0, 1): (CHROMA_DC_BITS, DC_VAL),
                      (1, 1): (CHROMA_AC_BITS, CHROMA_AC_VAL)}
     HUFFMAN_TABLES = {key: buildSymbolMap(bits, val) for key, (bits, val) in rawTables.items()}
-    data = encodeOutput(p, HUFFMAN_TABLES, rawTables, mode)
+    data = encodeOutput(p, HUFFMAN_TABLES, rawTables, mode, precision)
     Path(output).write_bytes(data)
 
 # CLI
-def _loadImage(path: Union[str, Path]):
-    with Image.open(path) as im:
-        if im.mode in ("1", "L", "I"):
-            return np.asarray(im.convert("L"))
-        return np.asarray(im.convert("RGB"))
-
 def parseArgs():
     parser = argparse.ArgumentParser()
 
@@ -640,14 +651,15 @@ def parseArgs():
     parser.add_argument("--subsampling", "-s", choices=["gray", "444", "422", "420"], default="420")
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--mode", "-m", type=int, default=0)
+    parser.add_argument("--precision", "-p", type=int, default=8)
 
     return parser.parse_args()
 
 def main():
     args = parseArgs()
 
-    im = _loadImage(args.input)
-    writeOutput(im, args.output, quality=args.quality, subsampling=args.subsampling, adaptive=args.adaptive, mode=args.mode)
+    im = io.imread(args.input)
+    writeOutput(im, args.output, quality=args.quality, subsampling=args.subsampling, adaptive=args.adaptive, mode=args.mode, precision=args.precision)
 
 if __name__ == "__main__":
     # pass

@@ -1,6 +1,6 @@
 import numpy as np
 
-from typing import Union, Dict, Tuple, List
+from typing import Optional, Union, Dict, Tuple, List
 from pathlib import Path
 from dataclasses import dataclass
 import struct
@@ -8,7 +8,6 @@ import argparse
 
 import matplotlib
 import matplotlib.pyplot as plt
-from typing_extensions import Optional
 matplotlib.use("QtAgg")
 
 from encoder import ZIGZAG, DCT, DCT_T
@@ -40,6 +39,7 @@ class ParsedImage:
     qtables: Dict[int, np.ndarray]
     htables: Dict[Tuple[int, int], Dict[Tuple[int, int], int]]
     scans: List[Scan]
+    precision: int
 
 class BitReader:
     def __init__(self, data: bytes):
@@ -70,13 +70,13 @@ class BitReader:
 def as_u16(data: bytes, i: int) -> int:
     return struct.unpack(">H", data[i:i + 2])[0]
 
-def inverseDCT(zigzag: np.ndarray, qtable: np.ndarray) -> np.ndarray:
+def inverseDCT(zigzag: np.ndarray, qtable: np.ndarray, precision: int = 8) -> np.ndarray:
     zz = np.zeros(64, dtype=np.float64)
     zz[ZIGZAG] = zigzag
 
     coeff = zz.reshape(8, 8)
-    inv = DCT_T @ (coeff * qtable) @ DCT + 128
-    return np.clip(inv, 0, 255)
+    inv = DCT_T @ (coeff * qtable) @ DCT + (1 << (precision - 1))
+    return np.clip(inv, 0, (1 << precision) - 1)
 
 def readSegment(data: bytes, i: int) -> Tuple[bytes, int]:
     length = as_u16(data, i)
@@ -119,7 +119,7 @@ def parseImage(source: Union[str, Path, bytes]) -> ParsedImage:
     if len(data) < 2 or data[:2] != b"\xFF\xD8":
         raise ValueError("Missing SOI marker")
 
-    height, width = None, None
+    height, width, precision = None, None, None
     components = None
     qtables, htables = {}, {}
     scans = []
@@ -143,27 +143,31 @@ def parseImage(source: Union[str, Path, bytes]) -> ParsedImage:
             parseDQT(payload, qtables)
         elif marker == 0xC4:    # DHT
             parseHuffmanTables(payload, htables)
-        elif marker == 0xC0 or marker == 0xC2:
-            height, width, components = parseSOF(payload)
+        elif marker in (0xC0, 0xC1, 0xC2):
+            height, width, components, precision = parseSOF(payload)
 
     if None in (height, width, components):
         raise ValueError("Missing SOF0")
     if not scans:
         raise ValueError("Missing scan data")
 
-    return ParsedImage(height, width, components, qtables, htables, scans)
+    return ParsedImage(height, width, components, qtables, htables, scans, precision)
 
 def parseDQT(payload, qtables) -> None:
     pos = 0
     while pos < len(payload):
-        # precision = payload[pos] >> 4
+        Pq = payload[pos] >> 4
+        table_size = 64 * (Pq + 1)
         qid = payload[pos] & 0x0F
         pos += 1
 
         zz = np.zeros(64, dtype=np.float64)
-        zz[ZIGZAG] = np.asarray(bytearray(payload[pos:pos + 64]), dtype=np.uint8).astype(np.float64)
+        if Pq:
+            zz[ZIGZAG] = np.asarray([as_u16(payload, pos + i) for i in range(0, 128, 2)]).astype(np.float64)
+        else:
+            zz[ZIGZAG] = np.asarray(bytearray(payload[pos:pos + table_size]), dtype=np.uint8).astype(np.float64)
         qtables[qid] = zz.reshape(8, 8)
-        pos += 64
+        pos += table_size
 
 def parseHuffmanTables(payload, htables) -> None:
     pos = 0
@@ -196,7 +200,8 @@ def _buildDecodeMap(bits, values):
         code <<= 1
     return map
 
-def parseSOF(payload: bytes) -> Tuple[int, int, List[Component]]:
+def parseSOF(payload: bytes) -> Tuple[int, int, List[Component], int]:
+    precision = payload[0]
     height, width = as_u16(payload, 1), as_u16(payload, 3)
     Nf = payload[5]
 
@@ -213,7 +218,7 @@ def parseSOF(payload: bytes) -> Tuple[int, int, List[Component]]:
 
         pos += 3
 
-    return height, width, components
+    return height, width, components, precision
 
 def parseSOS(payload: bytes, components: List[Component]) -> Tuple[List[Component], int, int, int, int]:
     Ns = payload[0]
@@ -226,12 +231,12 @@ def parseSOS(payload: bytes, components: List[Component]) -> Tuple[List[Componen
         cid = payload[pos]
         pos += 1
 
-        c = components[cid - 1]
+        c = next(c for c in components if c.cid == cid)
         if c.cid != cid:
             raise ValueError("Unmatched component ID")
         c.dcid = payload[pos] >> 4
         c.acid = payload[pos] & 0x0F
-        scan_components.append(c)
+        scan_components.append(Component(c.cid, c.name, c.v, c.h, c.qid, c.dcid, c.acid))
         pos += 1
 
     Ss, Se = payload[pos], payload[pos + 1]
@@ -277,7 +282,7 @@ def decodePlanes(im: ParsedImage) -> Dict[str, np.ndarray]:
             nblocks_x = (im.width  * c.h + 8 * max_h - 1) // (8 * max_h)
             for by in range(nblocks_y):
                 for bx in range(nblocks_x):
-                    coeffs[c.name][by, bx][scan.Ss:scan.Se + 1] = decodeBlock(br, None, ac_table, None, scan.Ss, scan.Se)[scan.Ss:scan.Se + 1]
+                    decodeBlock(br, None, ac_table, None, scan.Ss, scan.Se, coeffs[c.name][by, bx])
 
     planes = {}
     for c in im.components:
@@ -285,7 +290,7 @@ def decodePlanes(im: ParsedImage) -> Dict[str, np.ndarray]:
         for y in range(mcu_rows * c.v):
             for x in range(mcu_cols * c.h):
                 y0, x0 = y * 8, x * 8
-                plane[y0:y0 + 8, x0:x0 + 8] = inverseDCT(coeffs[c.name][y, x], im.qtables[c.qid])
+                plane[y0:y0 + 8, x0:x0 + 8] = inverseDCT(coeffs[c.name][y, x], im.qtables[c.qid], im.precision)
         planes[c.name] = plane
 
     return planes
@@ -295,8 +300,10 @@ def decodeBlock(br: BitReader,
                 ac_table,
                 pred: Optional[int],
                 Ss: int = 0,
-                Se: int = 63):
-    block = np.zeros(64, dtype=np.int32)
+                Se: int = 63,
+                block: Optional[np.ndarray] = None):
+    if block is None:
+        block = np.zeros(64, dtype=np.int32)
 
     if Ss == 0:
         ssss = readCodeword(br, dc_table)
@@ -357,23 +364,23 @@ def upsample(plane: np.ndarray,
 
     return out[:target_h, :target_w]
 
-def YCbCr2RGB(y, cb, cr) -> np.ndarray:
+def YCbCr2RGB(y, cb, cr, precision: int = 8) -> np.ndarray:
     """
     YCbCr to RGB conversion
     Four decimal position accuracy
     [T.871]
     """
-    cb -= 128
-    cr -= 128
+    cb -= 1 << precision - 1
+    cr -= 1 << precision - 1
 
     r = y + 1.402 * cr
     g = y - 0.3441 * cb - 0.7141 * cr
     b = y + 1.772 * cb
 
     rgb = np.stack([r, g, b], axis=2)
-    return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+    return np.clip(np.rint(rgb), 0, (1 << precision) - 1).astype(np.uint8 if precision == 8 else np.uint16)
 
-def decodeInput(source: Union[str, Path, bytes]) -> np.ndarray:
+def decodeInput(source: Union[str, Path, bytes]) -> Tuple[np.ndarray, int]:
     im = parseImage(source)
     planes = decodePlanes(im)
 
@@ -383,7 +390,7 @@ def decodeInput(source: Union[str, Path, bytes]) -> np.ndarray:
     y = planes["Y"]
 
     if len(im.components) == 1:
-        return np.rint(y[:im.height, :im.width]).astype(np.uint8)
+        return np.rint(y[:im.height, :im.width]).astype(np.uint8 if im.precision == 8 else np.uint16), im.precision
 
     y = y[:im.height, :im.width]
     cb = upsample(planes["Cb"],
@@ -395,7 +402,7 @@ def decodeInput(source: Union[str, Path, bytes]) -> np.ndarray:
                   max_v, max_h,
                   im.height, im.width)
 
-    return YCbCr2RGB(y, cb, cr)
+    return YCbCr2RGB(y, cb, cr, im.precision), im.precision
 
 def parseArgs():
     parser = argparse.ArgumentParser()
@@ -404,13 +411,14 @@ def parseArgs():
 
 if __name__ == "__main__":
     args = parseArgs()
-    im = decodeInput(args.input)
+    im, precision = decodeInput(args.input)
 
     fig = plt.figure(dpi=200)
 
     if im.ndim == 2:
-        plt.imshow(im, cmap="gray", vmin=0, vmax=255)
+        plt.imshow(im, cmap="gray", vmin=0, vmax=(1 << precision) - 1)
     else:
+        im = im.astype(np.float64) / ((1 << precision) - 1)
         plt.imshow(im)
 
     plt.axis("off")
