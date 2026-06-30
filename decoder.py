@@ -30,6 +30,7 @@ class Scan:
     Ah: int
     Al: int
     data: bytes
+    predictor: int
 
 @dataclass
 class ParsedImage:
@@ -40,6 +41,7 @@ class ParsedImage:
     htables: Dict[Tuple[int, int], Dict[Tuple[int, int], int]]
     scans: List[Scan]
     precision: int
+    lossless: bool
 
 class BitReader:
     def __init__(self, data: bytes):
@@ -123,6 +125,8 @@ def parseImage(source: Union[str, Path, bytes]) -> ParsedImage:
     components = None
     qtables, htables = {}, {}
     scans = []
+    predictor = None
+    lossless = False
 
     pos = 2
     while pos < len(data):
@@ -136,22 +140,24 @@ def parseImage(source: Union[str, Path, bytes]) -> ParsedImage:
             if components is None:
                 raise ValueError("SOS before SOF")
             scan_components, Ss, Se, Ah, Al = parseSOS(payload, components)
+            if lossless: predictor = Ss
             scan_data, pos = readScanData(data, pos)
-            scans.append(Scan(scan_components, Ss, Se, Ah, Al, scan_data))
+            scans.append(Scan(scan_components, Ss, Se, Ah, Al, scan_data, predictor))
 
         elif marker == 0xDB:    # DQT
             parseDQT(payload, qtables)
         elif marker == 0xC4:    # DHT
             parseHuffmanTables(payload, htables)
-        elif marker in (0xC0, 0xC1, 0xC2):
+        elif marker in (0xC0, 0xC1, 0xC2, 0xC3):
             height, width, components, precision = parseSOF(payload)
+            if marker == 0xC3: lossless = True
 
     if None in (height, width, components):
         raise ValueError("Missing SOF0")
     if not scans:
         raise ValueError("Missing scan data")
 
-    return ParsedImage(height, width, components, qtables, htables, scans, precision)
+    return ParsedImage(height, width, components, qtables, htables, scans, precision, lossless)
 
 def parseDQT(payload, qtables) -> None:
     pos = 0
@@ -245,6 +251,35 @@ def parseSOS(payload: bytes, components: List[Component]) -> Tuple[List[Componen
     return scan_components, Ss, Se, Ah, Al
 
 # Decoder
+def reconstructSample(plane, y, x, predictor: int, precision: int):
+    if y == 0 and x == 0:
+        return 1 << (precision - 1)
+    if y == 0:
+        return int(plane[0, x - 1])
+    if x == 0:
+        return int(plane[y - 1, 0])
+
+    a = int(plane[y, x - 1])
+    b = int(plane[y - 1, x])
+    c = int(plane[y - 1, x - 1])
+
+    # [T.81] - Table H.1
+    if predictor == 1:
+        return a
+    elif predictor == 2:
+        return b
+    elif predictor == 3:
+        return c
+    elif predictor == 4:
+        return a + b - c
+    elif predictor == 5:
+        return a + ((b - c) >> 1)
+    elif predictor == 6:
+        return b + ((a - c) >> 1)
+    elif predictor == 7:
+        return (a + b) >> 1
+    raise ValueError("Invalid predictor")
+
 def decodePlanes(im: ParsedImage) -> Dict[str, np.ndarray]:
     max_v = max(c.v for c in im.components)
     max_h = max(c.h for c in im.components)
@@ -254,13 +289,32 @@ def decodePlanes(im: ParsedImage) -> Dict[str, np.ndarray]:
     mcu_cols = (im.width + mcu_w - 1) // mcu_w
 
     coeffs = {}
+    planes = {}
     for c in im.components:
-        coeffs[c.name] = np.zeros((mcu_rows * c.v, mcu_cols * c.h, 64), dtype=np.float64)
+        if im.lossless:
+            h = -(-im.height * c.v // max_v)
+            w = -(-im.width * c.h // max_h)
+            planes[c.name] = np.zeros((h, w), dtype=np.int32)
+        else:
+            coeffs[c.name] = np.zeros((mcu_rows * c.v, mcu_cols * c.h, 64), dtype=np.float64)
 
     for scan in im.scans:
         br = BitReader(scan.data)
 
-        if scan.Ss == 0:
+        if im.lossless:
+            for c in scan.components:
+                table = im.htables[(0, c.dcid)]
+                plane = planes[c.name]
+                h, w = plane.shape
+
+                for y in range(h):
+                    for x in range(w):
+                        Px = reconstructSample(plane, y, x, scan.predictor, im.precision)
+                        ssss = readCodeword(br, table)
+                        diff = getCoeff(br, ssss)
+                        plane[y, x] = Px + diff
+
+        elif scan.Ss == 0:
             pred = {c.cid: 0 for c in scan.components}
             for my in range(mcu_rows):
                 for mx in range(mcu_cols):
@@ -284,14 +338,17 @@ def decodePlanes(im: ParsedImage) -> Dict[str, np.ndarray]:
                 for bx in range(nblocks_x):
                     decodeBlock(br, None, ac_table, None, scan.Ss, scan.Se, coeffs[c.name][by, bx])
 
-    planes = {}
+
     for c in im.components:
-        plane = np.zeros((mcu_rows * c.v * 8, mcu_cols * c.h * 8), dtype=np.float64)
-        for y in range(mcu_rows * c.v):
-            for x in range(mcu_cols * c.h):
-                y0, x0 = y * 8, x * 8
-                plane[y0:y0 + 8, x0:x0 + 8] = inverseDCT(coeffs[c.name][y, x], im.qtables[c.qid], im.precision)
-        planes[c.name] = plane
+        if im.lossless:
+            planes[c.name] = np.clip(planes[c.name], 0, (1 << im.precision) - 1).astype(np.float64)
+        else:
+            plane = np.zeros((mcu_rows * c.v * 8, mcu_cols * c.h * 8), dtype=np.float64)
+            for y in range(mcu_rows * c.v):
+                for x in range(mcu_cols * c.h):
+                    y0, x0 = y * 8, x * 8
+                    plane[y0:y0 + 8, x0:x0 + 8] = inverseDCT(coeffs[c.name][y, x], im.qtables[c.qid], im.precision)
+            planes[c.name] = plane
 
     return planes
 
