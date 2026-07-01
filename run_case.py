@@ -1,8 +1,14 @@
 from pathlib import Path
-from PIL import Image
+import imageio.v3 as io
 
 from encoder import writeOutput
 import argparse
+
+MODES = (1,)
+PRECISIONS = (8,)
+SUBSAMPLINGS = ("420",)
+QUALITIES = (10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+OUT_DIR = Path("tmp")
 
 def parseArgs():
     parser = argparse.ArgumentParser()
@@ -13,23 +19,31 @@ def main():
     args = parseArgs()
 
     input = Path(args.input)
-    out_dir = Path("res")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    with Image.open(input) as im:
-        arr = im.convert("RGB")
+    im = io.imread(input)
 
-        for adaptive in (False, True):
-            for subsampling in ("444", "422", "420", "gray"):
-                out = out_dir / f"q50_{subsampling}_{'adaptive' if adaptive else 'default'}.jpg"
+    for mode in MODES:
+        for precision in PRECISIONS:
+            for subsampling in SUBSAMPLINGS:
+                for adaptive in (True,):
+                    for quality in QUALITIES:
+                        if precision == 12 and not adaptive:
+                            continue
+                        if mode == 0 and precision != 8:
+                            continue
 
-                writeOutput(
-                    arr,
-                    out,
-                    quality=50,
-                    subsampling=subsampling,
-                    adaptive=adaptive
-                )
+                        out = OUT_DIR / f"m{mode}_q{quality}_{subsampling}_{'adaptive' if adaptive else 'default'}_{precision}.jpg"
+
+                        writeOutput(
+                            im,
+                            out,
+                            quality=quality,
+                            subsampling=subsampling,
+                            adaptive=adaptive,
+                            mode=mode,
+                            precision=precision
+                        )
 
 if __name__ == "__main__":
     main()

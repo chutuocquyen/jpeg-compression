@@ -713,8 +713,10 @@ def writeOutput(im,
                 predictor: int = 1) -> None:
     p = preprocessImage(im, quality, subsampling, precision if mode else 8)
 
-    if mode == 3:
+    if mode == 3 or precision == 12:
         adaptive = True
+    if mode == 0:
+        precision = 8
 
     if adaptive:
         rawTables = buildAdaptiveTables(countSymbols(p, p.qtables, mode==3, predictor))
