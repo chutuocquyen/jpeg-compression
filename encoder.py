@@ -65,6 +65,7 @@ LUMA_AC_VAL = [0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,
 CHROMA_AC_BITS = [0x00, 0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04,   # [T.81] - Table K.6
                   0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77]
 CHROMA_AC_VAL = [0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,0x71,
+
                  0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xA1,0xB1,0xC1,0x09,0x23,0x33,0x52,0xF0,
                  0x15,0x62,0x72,0xD1,0x0A,0x16,0x24,0x34,0xE1,0x25,0xF1,0x17,0x18,0x19,0x1A,0x26,
                  0x27,0x28,0x29,0x2A,0x35,0x36,0x37,0x38,0x39,0x3A,0x43,0x44,0x45,0x46,0x47,0x48,
@@ -75,6 +76,10 @@ CHROMA_AC_VAL = [0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x5
                  0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,0xD2,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,
                  0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,
                  0xF9,0xFA]
+DEFAULT_DHT = {(0, 0): (LUMA_DC_BITS, DC_VAL),    # (coeff, channel)
+               (1, 0): (LUMA_AC_BITS, LUMA_AC_VAL),
+               (0, 1): (CHROMA_DC_BITS, DC_VAL),
+               (1, 1): (CHROMA_AC_BITS, CHROMA_AC_VAL)}
 
 @dataclass(frozen=True)
 class Component:
@@ -132,6 +137,26 @@ class BitWriter:
             self.acc = 0
             self.nbits = 0
         return bytes(self.out)
+
+class SymbolCounter:
+    def __init__(self):
+        self.dc_freq: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self.ac_freq: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
+    def __getitem__(self, key: Tuple[int, int]):
+        table_class, table_id = key
+        freq = self.dc_freq[table_id] if table_class == 0 else self.ac_freq[table_id]
+
+        class Dummy:
+            def __getitem__(self, symbol: int):
+                freq[symbol] += 1
+                return (0, 0)
+        return Dummy()
+
+    def write(self, code: int, length: int):
+        pass
+    def flush(self):
+        return b""
 
 # Process image
 def normalizeImage(im, precision):
@@ -307,61 +332,38 @@ def predictSample(plane: np.ndarray, y: int, x: int, predictor: int, precision: 
         return (a + b) >> 1
     raise ValueError("Invalid predictor")
 
-def countSymbols(image: PreprocessedImage, qtables: Optional[Dict], lossless: bool = False, predictor: int = 1):
-    dc_freq = defaultdict(lambda: defaultdict(int))
-    ac_freq = defaultdict(lambda: defaultdict(int))
+def buildScanTables(im: PreprocessedImage, Ss: int = 0, Se: int = 63,
+                    components: Optional[List[str]] = None,
+                    adaptive: bool = False,
+                    lossless: bool = False, predictor: int = 1):
+    if components is None:
+        components = [c.name for c in im.components]
 
-    if lossless:
-        for c in image.components:
-            h = (image.height * c.v - 1) // image.max_v + 1
-            w = (image.width * c.h - 1) // image.max_h + 1
-            plane = np.rint(image.planes[c.name]).astype(np.int32)[:h, :w]
+    if not adaptive:
+        keys = set()
 
-            for y in range(h):
-                for x in range(w):
-                    Px = predictSample(plane, y, x, predictor, image.precision)
-                    diff = int(plane[y, x]) - Px
-                    dc_freq[c.dcid][category(diff)] += 1
+        for c in components:
+            component = next(i for i in im.components if i.name == c)
 
-        return dict(dc_freq), {}
+            if Ss == 0:
+                keys.add((0, component.dcid))
+            if Se > 0 and not lossless:
+                keys.add((1, component.acid))
 
-    pred = {c.name: 0 for c in image.components}
-
-    for c, block in getMCUs(image):
-        zigzag = quantizeBlock(block, qtables[c.qid], image.precision)
-
-        # DC
-        dc = int(zigzag[0])
-        dc_freq[c.dcid][category(dc - int(pred[c.name]))] += 1
-        pred[c.name] = dc
-
-        # AC
-        run = 0
-        for value in (int(i) for i in zigzag[1:]):
-            if value == 0:
-                run += 1
-                if run == 16:
-                    ac_freq[c.acid][0xF0] += 1
-                    run = 0
-                continue
-
-            size = category(value)
-            run_size = (run << 4) | size
-            ac_freq[c.acid][run_size] += 1
-            run = 0
-        if run: ac_freq[c.acid][0] += 1
-
-    return dict(dc_freq), dict(ac_freq)
-
-def buildAdaptiveTables(freqs) -> Dict[Tuple[int, int], Tuple[list, list]]:
+        tables = {key: DEFAULT_DHT[key] for key in sorted(keys)}
+        lookup = {key: buildSymbolMap(bits, val) for key, (bits, val) in tables.items()}
+        return tables, lookup
+    freqs = getEntropyData(im, None, Ss, Se, components,
+                           lossless, predictor, as_counter=True)
     tables = {}
     for dcid, freq in freqs[0].items():
-        tables[(0, dcid)] = _buildAdaptiveTable(freq)
+        tables[(0, dcid)] = _buildScanTable(freq)
     for acid, freq in freqs[1].items():
-        tables[(1, acid)] = _buildAdaptiveTable(freq)
-    return tables
+        tables[(1, acid)] = _buildScanTable(freq)
+    lookup = {key: buildSymbolMap(bits, val) for key, (bits, val) in tables.items()}
+    return tables, lookup
 
-def _buildAdaptiveTable(freq: dict) -> Tuple[list, list]:
+def _buildScanTable(freq: dict) -> Tuple[list, list]:
     MAX_SYMBOLS = 257   # 256 + 1
     arr = [0] * MAX_SYMBOLS
     for symbol, count in freq.items():
@@ -453,14 +455,17 @@ def getEntropyData(image, lookup,
                    Se: int = 63,
                    components: Optional[List[str]] = None,
                    lossless: bool = False,
-                   predictor: int = 1):
+                   predictor: int = 1,
+                   as_counter: bool = False):
     if Ss > Se:
         raise ValueError("Invalid spectral selectors")
 
     if components is None:
         components = [c.name for c in image.components]
 
-    bw = BitWriter()
+    counter = SymbolCounter()
+    bw = counter if as_counter else BitWriter()
+    lookup = counter if as_counter else lookup
 
     if lossless:
         for c in components:
@@ -473,15 +478,16 @@ def getEntropyData(image, lookup,
             for y in range(h):
                 for x in range(w):
                     Px = predictSample(plane, y, x, predictor, image.precision)
-                    encodeSample(int(plane[y, x]), Px, component.dcid, bw, lookup)
+                    if as_counter:
+                        counter.dc_freq[component.dcid][category(int(plane[y, x]) - Px)] += 1
+                    else:
+                        encodeSample(int(plane[y, x]), Px, component.dcid, bw, lookup)
 
+        if as_counter:
+            return dict(counter.dc_freq), {}
         return bw.flush()
 
-    if len(components) == 1:
-        iter = getMCUs(image, components[0])
-    else:
-        iter = getMCUs(image)
-
+    iter = getMCUs(image, components[0]) if len(components) == 1  else getMCUs(image)
     if Ss == 0:
         pred = {c: 0 for c in components}
         for c, block in iter:
@@ -491,6 +497,9 @@ def getEntropyData(image, lookup,
         for c, block in iter:
             encodeBlock(block, image.qtables[c.qid], None,
                         None, c.acid, bw, lookup, image.precision, Ss, Se)
+
+    if as_counter:
+        return dict(counter.dc_freq), dict(counter.ac_freq)
     return bw.flush()
 
 def getMCUs(image, component: Optional[str]=None):
@@ -521,7 +530,7 @@ def encodeBlock(block,
                 pred: Optional[int],
                 dc_table_id: Optional[int],
                 ac_table_id: int,
-                bw: BitWriter,
+                bw: Union[BitWriter, SymbolCounter],
                 lookup,
                 precision,
                 Ss: int,
@@ -610,15 +619,11 @@ def getSOF(image: PreprocessedImage, n: int):
         payload.append(0 if n == 3 else c.qid)
     return buildMarker(0xC0 | n, bytes(payload))
 
-def getHuffmanTables(tables: Dict, color: bool, lossless: bool):
+def getHuffmanTables(tables: Dict):
     out = bytearray()
-    out.extend(_getHuffmanTable(0, 0, *tables[(0, 0)]))
-    if not lossless:
-        out.extend(_getHuffmanTable(1, 0, *tables[(1, 0)]))
-    if color:
-        out.extend(_getHuffmanTable(0, 1, *tables[(0, 1)]))
-        if not lossless:
-            out.extend(_getHuffmanTable(1, 1, *tables[(1, 1)]))
+    for table_class, table_id in sorted(tables.keys()):
+        bits, values = tables[(table_class, table_id)]
+        out.extend(_getHuffmanTable(table_class, table_id, bits, values))
     return bytes(out)
 
 def  _getHuffmanTable(c, id, bits, values):
@@ -655,45 +660,55 @@ def getScanHeader(components: List[Component],
 
 # Encoder API
 def encodeOutput(im: PreprocessedImage,
-                 lookup: Dict,
-                 tables: Dict,
+                 adaptive: bool,
                  mode: int,
                  predictor: int) -> bytes:
+
     out = bytearray()
     components = im.components
 
     out.extend(buildMarker(0xD8))       # SOI - FFD8
     out.extend(getAPP0_JFIF())          # [T.871] - 6.3
     if mode != 3:
-        out.extend(getDQT(im.qtables, im.precision if mode else 8))
-    out.extend(getHuffmanTables(tables, len(components) == 3, mode == 3))
+        out.extend(getDQT(im.qtables, im.precision))
 
     if mode == 0:       # Baseline
+        tables, lookup = buildScanTables(im, adaptive=adaptive)
         out.extend(getSOF(im, 0))
+        out.extend(getHuffmanTables(tables))
         out.extend(getScanHeader(components))
         out.extend(getEntropyData(im, lookup))
 
     elif mode == 1:     # Extended
+        tables, lookup = buildScanTables(im, adaptive=adaptive)
         out.extend(getSOF(im, 1))
+        out.extend(getHuffmanTables(tables))
         out.extend(getScanHeader(components))
         out.extend(getEntropyData(im, lookup))
 
     elif mode == 2:     # Progressive
         out.extend(getSOF(im, 2))
         # DC
+        tables, lookup = buildScanTables(im, 0, 0, adaptive=adaptive)
+        out.extend(getHuffmanTables(tables))
         out.extend(getScanHeader(components, 0, 0))
         out.extend(getEntropyData(im, lookup, 0, 0))
         # AC
-        out.extend(getScanHeader([components[0]], 1, 2))
-        out.extend(getEntropyData(im, lookup, 1, 2, [components[0].name]))
-        out.extend(getScanHeader([components[0]], 3, 63))
-        out.extend(getEntropyData(im, lookup, 3, 63, [components[0].name]))
+        for Ss, Se in [(1, 2), (3, 63)]:
+            tables, lookup = buildScanTables(im, Ss, Se, [components[0].name], adaptive=adaptive)
+            out.extend(getHuffmanTables(tables))
+            out.extend(getScanHeader([components[0]], Ss, Se))
+            out.extend(getEntropyData(im, lookup, Ss, Se, [components[0].name]))
         for c in components[1:]:
+            tables, lookup = buildScanTables(im, 1, 63, [c.name], adaptive=adaptive)
+            out.extend(getHuffmanTables(tables))
             out.extend(getScanHeader([c], 1, 63))
             out.extend(getEntropyData(im, lookup, 1, 63, [c.name]))
 
     elif mode == 3:     # Lossless
         out.extend(getSOF(im, 3))
+        tables, lookup = buildScanTables(im, 0, 0, adaptive=adaptive, lossless=True, predictor=predictor)
+        out.extend(getHuffmanTables(tables))
         for c in components:
             out.extend(getScanHeader([c], Se=0, predictor=predictor))
             out.extend(getEntropyData(im, lookup, components=[c.name], lossless=True, predictor=predictor))
@@ -703,7 +718,7 @@ def encodeOutput(im: PreprocessedImage,
     out.extend(buildMarker(0xD9))        # EOI - FFD9
     return bytes(out)
 
-def writeOutput(im,
+def writeOutput(im: np.ndarray,
                 output: Union[str, Path],
                 quality: int = 50,
                 subsampling: Subsampling = "420",
@@ -715,18 +730,8 @@ def writeOutput(im,
 
     if mode == 3 or precision == 12:
         adaptive = True
-    if mode == 0:
-        precision = 8
 
-    if adaptive:
-        rawTables = buildAdaptiveTables(countSymbols(p, p.qtables, mode==3, predictor))
-    else:
-        rawTables = {(0, 0): (LUMA_DC_BITS, DC_VAL),    # (coeff, channel)
-                     (1, 0): (LUMA_AC_BITS, LUMA_AC_VAL),
-                     (0, 1): (CHROMA_DC_BITS, DC_VAL),
-                     (1, 1): (CHROMA_AC_BITS, CHROMA_AC_VAL)}
-    HUFFMAN_TABLES = {key: buildSymbolMap(bits, val) for key, (bits, val) in rawTables.items()}
-    data = encodeOutput(p, HUFFMAN_TABLES, rawTables, mode, predictor)
+    data = encodeOutput(p, adaptive, mode, predictor)
     Path(output).write_bytes(data)
 
 # CLI
@@ -751,5 +756,4 @@ def main():
     writeOutput(im, args.output, quality=args.quality, subsampling=args.subsampling, adaptive=args.adaptive, mode=args.mode, precision=args.precision, predictor=args.predictor)
 
 if __name__ == "__main__":
-    # pass
     sys.exit(not main())

@@ -3,8 +3,8 @@
 ## Features
 - Baseline sequential DCT JPEG (Mode 0)
 - Extended sequential DCT JPEG (Mode 1)
-- Lossless JPEG (Mode 2)
-- Progressive DCT JPEG (Mode 3)
+- Progressive DCT JPEG (Mode 2) - Spectral selection
+- Lossless JPEG (Mode 3)
 - 8-bit and 12-bit precision
 - Adaptive Huffman tables
 - Chroma subsampling ratios: 444, 422, 420
