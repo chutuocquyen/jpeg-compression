@@ -31,6 +31,7 @@ class Scan:
     Al: int
     data: bytes
     predictor: int
+    htables: Dict[Tuple[int, int], Dict[Tuple[int, int], int]]
 
 @dataclass
 class ParsedImage:
@@ -142,7 +143,7 @@ def parseImage(source: Union[str, Path, bytes]) -> ParsedImage:
             scan_components, Ss, Se, Ah, Al = parseSOS(payload, components)
             if lossless: predictor = Ss
             scan_data, pos = readScanData(data, pos)
-            scans.append(Scan(scan_components, Ss, Se, Ah, Al, scan_data, predictor))
+            scans.append(Scan(scan_components, Ss, Se, Ah, Al, scan_data, predictor, dict(htables)))
 
         elif marker == 0xDB:    # DQT
             parseDQT(payload, qtables)
@@ -303,7 +304,7 @@ def decodePlanes(im: ParsedImage) -> Dict[str, np.ndarray]:
 
         if im.lossless:
             for c in scan.components:
-                table = im.htables[(0, c.dcid)]
+                table = scan.htables[(0, c.dcid)]
                 plane = planes[c.name]
                 h, w = plane.shape
 
@@ -319,8 +320,8 @@ def decodePlanes(im: ParsedImage) -> Dict[str, np.ndarray]:
             for my in range(mcu_rows):
                 for mx in range(mcu_cols):
                     for c in scan.components:
-                        dc_table = im.htables[(0, c.dcid)]
-                        ac_table = im.htables[(1, c.acid)] if scan.Se > 0 else None
+                        dc_table = scan.htables[(0, c.dcid)]
+                        ac_table = scan.htables[(1, c.acid)] if scan.Se > 0 else None
 
                         for vy in range(c.v):
                             for hx in range(c.h):
@@ -331,7 +332,7 @@ def decodePlanes(im: ParsedImage) -> Dict[str, np.ndarray]:
 
         else:
             c = scan.components[0]
-            ac_table = im.htables[(1, c.acid)]
+            ac_table = scan.htables[(1, c.acid)]
             nblocks_y = (im.height * c.v + 8 * max_v - 1) // (8 * max_v)
             nblocks_x = (im.width  * c.h + 8 * max_h - 1) // (8 * max_h)
             for by in range(nblocks_y):
