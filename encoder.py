@@ -353,6 +353,7 @@ def buildScanTables(im: PreprocessedImage, Ss: int = 0, Se: int = 63,
         tables = {key: DEFAULT_DHT[key] for key in sorted(keys)}
         lookup = {key: buildSymbolMap(bits, val) for key, (bits, val) in tables.items()}
         return tables, lookup
+
     freqs = getEntropyData(im, None, Ss, Se, components,
                            lossless, predictor, as_counter=True)
     tables = {}
@@ -550,25 +551,39 @@ def encodeBlock(block,
     # AC
     if Se > 0:
         ac_table = lookup[(1, ac_table_id)]
-        run = 0     # Zero count
-        for value in (int(i) for i in zigzag[max(1, Ss):Se + 1]):
-            if value == 0:
-                run += 1
-                if run == 16:
+        i = max(1, Ss)
+
+        while i <= Se:
+            run = 0
+
+            if zigzag[i] == 0:
+                j = i
+
+                while j <= Se and zigzag[j] == 0:
+                    j += 1
+
+                if j > Se:
+                    code, length = ac_table[0x00]   # EOB
+                    bw.write(code, length)
+                    break
+
+                run = j - i
+                while run >= 16:
                     code, length = ac_table[0xF0]
                     bw.write(code, length)
-                    run = 0
-                continue
+                    run -= 16
+
+                value = zigzag[j]
+                i = j + 1
+            else:
+                value = zigzag[i]
+                i += 1
 
             size = category(value)
             run_size = (run << 4) | size
             code, length = ac_table[run_size]
             bw.write(code, length)
             bw.write(signedBits(value, size), size)
-            run = 0
-        if run:     # EOB
-            code, length = ac_table[0x00]
-            bw.write(code, length)
 
     if Ss == 0:
         return dc
