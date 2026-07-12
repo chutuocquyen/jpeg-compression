@@ -103,6 +103,7 @@ class PreprocessedImage:
     mcu_h: int
     mcu_w: int
     precision: int
+    quant_cache: List[Optional[List[Optional[np.ndarray]]]]
 
 class BitWriter:
     def __init__(self):
@@ -143,7 +144,7 @@ class BitWriter:
         return bytes(self.out)
 
 class _Counter:
-    def __init__(self, freq: Dict[int, int]):
+    def __init__(self, freq: List[int]):
         self.freq = freq
     def __getitem__(self, symbol: int):
         self.freq[symbol] += 1
@@ -151,8 +152,8 @@ class _Counter:
 
 class SymbolCounter:
     def __init__(self):
-        self.dc_freq: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
-        self.ac_freq: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self.dc_freq: Dict[int, List[int]] = defaultdict(lambda: [0] * 256)
+        self.ac_freq: Dict[int, List[int]] = defaultdict(lambda: [0] * 256)
         self.tables: Dict[Tuple[int, int], _Counter] = {}
 
     def __getitem__(self, key: Tuple[int, int]):
@@ -233,7 +234,7 @@ def preprocessImage(im,
         target_h, target_w = getTargetSize(h0, 8), getTargetSize(w0, 8)
         components = [Component(1, "Y", 1, 1, 0, 0, 0)]
         planes = {"Y": padEdge(y, target_h, target_w)}
-        return PreprocessedImage(h0, w0, "gray", components, planes, {0: qtableY}, 1, 1, 8, 8, precision)
+        return PreprocessedImage(h0, w0, "gray", components, planes, {0: qtableY}, 1, 1, 8, 8, precision, [None])
 
     y, cb, cr = RGB2YCbCr(arr, precision)
 
@@ -264,7 +265,7 @@ def preprocessImage(im,
             Component(3, "Cr", 1, 1, 1, 1, 1)
             ]
     planes = {"Y": y_pad, "Cb": cb_ds, "Cr": cr_ds}
-    return PreprocessedImage(h0, w0, subsampling, components, planes, {0: qtableY, 1: qtableC}, v_samplingFactor, h_samplingFactor, mcu_h, mcu_w, precision)
+    return PreprocessedImage(h0, w0, subsampling, components, planes, {0: qtableY, 1: qtableC}, v_samplingFactor, h_samplingFactor, mcu_h, mcu_w, precision, [None, None, None])
 
 # DCT & Quantization
 def generateDCT():
@@ -366,7 +367,8 @@ def buildScanTables(im: PreprocessedImage, Ss: int = 0, Se: int = 63,
         return tables, lookup
 
     freqs = getEntropyData(im, None, Ss, Se, components,
-                           lossless, predictor, as_counter=True)
+                           lossless, predictor, as_counter=True,
+                           use_cache=not lossless)
     tables = {}
     for dcid, freq in freqs[0].items():
         tables[(0, dcid)] = _buildScanTable(freq)
@@ -375,10 +377,10 @@ def buildScanTables(im: PreprocessedImage, Ss: int = 0, Se: int = 63,
     lookup = {key: buildSymbolMap(bits, val) for key, (bits, val) in tables.items()}
     return tables, lookup
 
-def _buildScanTable(freq: dict) -> Tuple[list, list]:
+def _buildScanTable(freq: List[int]) -> Tuple[list, list]:
     MAX_SYMBOLS = 257   # 256 + 1
     arr = [0] * MAX_SYMBOLS
-    for symbol, count in freq.items():
+    for symbol, count in enumerate(freq):
         if symbol < 0 or symbol > 255: raise ValueError("Invalid symbol")
         arr[symbol] = count
     arr[-1] = 1
@@ -468,7 +470,8 @@ def getEntropyData(image, lookup,
                    components: Optional[List[str]] = None,
                    lossless: bool = False,
                    predictor: int = 1,
-                   as_counter: bool = False):
+                   as_counter: bool = False,
+                   use_cache: bool = False):
     if Ss > Se:
         raise ValueError("Invalid spectral selectors")
 
@@ -502,13 +505,12 @@ def getEntropyData(image, lookup,
     iter = getMCUs(image, components[0]) if len(components) == 1 else getMCUs(image)
     if Ss == 0:
         pred = {c: 0 for c in components}
-        for c, block in iter:
-            pred[c.name] = encodeBlock(block, image.qtables[c.qid], pred[c.name],
-                                       c.dcid, c.acid, bw, lookup, image.precision, Ss, Se)
+        for c, block_idx, block in iter:
+            pred[c.name] = encodeBlock(image, c, block_idx, block, pred[c.name], bw, lookup, Ss, Se, use_cache)
     else:
-        for c, block in iter:
-            encodeBlock(block, image.qtables[c.qid], None,
-                        None, c.acid, bw, lookup, image.precision, Ss, Se)
+        for c, block_idx, block in iter:
+            encodeBlock(image, c, block_idx, block,
+                        None, bw, lookup, Ss, Se, use_cache)
 
     if as_counter:
         return dict(counter.dc_freq), dict(counter.ac_freq)
@@ -519,39 +521,55 @@ def getMCUs(image, component: Optional[str] = None):
         c = next((c for c in image.components if c.name == component), None)
         if c is None:
             raise ValueError("Invalid component")
-        nblocks_y = (image.height * c.v - 1) // (8 * image.max_v) + 1
-        nblocks_x = (image.width * c.h - 1) // (8 * image.max_h) + 1
-        for y in range(nblocks_y):
-            for x in range(nblocks_x):
-                y0, x0 = y * 8, x * 8
-                yield c, image.planes[c.name][y0:y0 + 8, x0:x0 + 8]
+        n_blocks_y = (image.height * c.v - 1) // (8 * image.max_v) + 1
+        n_blocks_x = (image.width * c.h - 1) // (8 * image.max_h) + 1
+        idx_blocks_x = image.planes[c.name].shape[1] // 8
+        for block_y in range(n_blocks_y):
+            for block_x in range(n_blocks_x):
+                y0, x0 = block_y * 8, block_x * 8
+                block_idx = block_y * idx_blocks_x + block_x
+                yield c, block_idx, image.planes[c.name][y0:y0 + 8, x0:x0 + 8]
     else:
         for my in range(0, image.planes["Y"].shape[0], image.mcu_h):
             for mx in range(0, image.planes["Y"].shape[1], image.mcu_w):
                 for c in image.components:
                     y = (my * c.v) // image.max_v
                     x = (mx * c.h) // image.max_h
+                    idx_blocks_x = image.planes[c.name].shape[1] // 8
                     for vy in range(c.v):
                         for hx in range(c.h):
                             y0 = y + vy * 8
                             x0 = x + hx * 8
-                            yield c, image.planes[c.name][y0:y0 + 8, x0:x0 + 8]
+                            block_idx = (y0 // 8) * idx_blocks_x + (x0 // 8)
+                            yield c, block_idx, image.planes[c.name][y0:y0 + 8, x0:x0 + 8]
 
-def encodeBlock(block,
-                qtable,
+def encodeBlock(im: PreprocessedImage,
+                component: Component,
+                block_idx: int,
+                block,
                 pred: Optional[int],
-                dc_table_id: Optional[int],
-                ac_table_id: int,
                 bw: Union[BitWriter, SymbolCounter],
                 lookup,
-                precision,
                 Ss: int,
-                Se: int):
-    zigzag = quantizeBlock(block, qtable, precision)
+                Se: int,
+                use_cache: bool = False):
+    zigzag = None
+    if use_cache:
+        cache = im.quant_cache[component.cid - 1]
+        if cache is None:
+            plane = im.planes[component.name]
+            cache = [None] * (plane.shape[0] // 8 * (plane.shape[1] // 8))
+            im.quant_cache[component.cid - 1] = cache
+        zigzag = cache[block_idx]
+
+    if zigzag is None:
+        zigzag = quantizeBlock(block, im.qtables[component.qid], im.precision)
+        if use_cache:
+            cache[block_idx] = zigzag
 
     # DC
     if Ss == 0:
-        dc_table = lookup[(0, dc_table_id)]
+        dc_table = lookup[(0, component.dcid)]
         dc = int(zigzag[0])
         diff = dc - int(pred)
         ssss = category(diff)
@@ -561,7 +579,7 @@ def encodeBlock(block,
 
     # AC
     if Se > 0:
-        ac_table = lookup[(1, ac_table_id)]
+        ac_table = lookup[(1, component.acid)]
         i = max(1, Ss)
 
         while i <= Se:
@@ -703,14 +721,14 @@ def encodeOutput(im: PreprocessedImage,
         out.extend(getSOF(im, 0))
         out.extend(getHuffmanTables(tables))
         out.extend(getScanHeader(components))
-        out.extend(getEntropyData(im, lookup))
+        out.extend(getEntropyData(im, lookup, use_cache=adaptive))
 
     elif mode == 1:     # Extended
         tables, lookup = buildScanTables(im, adaptive=adaptive)
         out.extend(getSOF(im, 1))
         out.extend(getHuffmanTables(tables))
         out.extend(getScanHeader(components))
-        out.extend(getEntropyData(im, lookup))
+        out.extend(getEntropyData(im, lookup, use_cache=adaptive))
 
     elif mode == 2:     # Progressive
         out.extend(getSOF(im, 2))
@@ -718,18 +736,18 @@ def encodeOutput(im: PreprocessedImage,
         tables, lookup = buildScanTables(im, 0, 0, adaptive=adaptive)
         out.extend(getHuffmanTables(tables))
         out.extend(getScanHeader(components, 0, 0))
-        out.extend(getEntropyData(im, lookup, 0, 0))
+        out.extend(getEntropyData(im, lookup, 0, 0, use_cache=True))
         # AC
         for Ss, Se in [(1, 2), (3, 63)]:
             tables, lookup = buildScanTables(im, Ss, Se, [components[0].name], adaptive=adaptive)
             out.extend(getHuffmanTables(tables))
             out.extend(getScanHeader([components[0]], Ss, Se))
-            out.extend(getEntropyData(im, lookup, Ss, Se, [components[0].name]))
+            out.extend(getEntropyData(im, lookup, Ss, Se, [components[0].name], use_cache=True))
         for c in components[1:]:
             tables, lookup = buildScanTables(im, 1, 63, [c.name], adaptive=adaptive)
             out.extend(getHuffmanTables(tables))
             out.extend(getScanHeader([c], 1, 63))
-            out.extend(getEntropyData(im, lookup, 1, 63, [c.name]))
+            out.extend(getEntropyData(im, lookup, 1, 63, [c.name], use_cache=True))
 
     elif mode == 3:     # Lossless
         out.extend(getSOF(im, 3))
