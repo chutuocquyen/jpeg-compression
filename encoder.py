@@ -65,7 +65,6 @@ LUMA_AC_VAL = [0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,
 CHROMA_AC_BITS = [0x00, 0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04,   # [T.81] - Table K.6
                   0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77]
 CHROMA_AC_VAL = [0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,0x71,
-
                  0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xA1,0xB1,0xC1,0x09,0x23,0x33,0x52,0xF0,
                  0x15,0x62,0x72,0xD1,0x0A,0x16,0x24,0x34,0xE1,0x25,0xF1,0x17,0x18,0x19,0x1A,0x26,
                  0x27,0x28,0x29,0x2A,0x35,0x36,0x37,0x38,0x39,0x3A,0x43,0x44,0x45,0x46,0x47,0x48,
@@ -119,14 +118,19 @@ class BitWriter:
         if code < 0 or code >= (1 << length):
             raise ValueError("Invalid code word")
 
-        for pos in range(length - 1, -1, -1):
-            self.acc = (self.acc << 1) | ((code >> pos) & 1)
-            self.nbits += 1
-            if self.nbits == 8:
-                self.out.append(self.acc)
-                if self.acc == 0xFF: self.out.append(0x00)      # Byte stuffing
-                self.acc = 0
-                self.nbits = 0
+        self.acc = (self.acc << length) | code
+        self.nbits += length
+
+        while self.nbits >= 8:
+            self.nbits -= 8
+            byte = (self.acc >> self.nbits) & 0xFF
+            self.out.append(byte)
+            if byte == 0xFF: self.out.append(0x00)      # Byte stuffing
+
+        if self.nbits:
+            self.acc &= (1 << self.nbits) - 1
+        else:
+            self.acc = 0
 
     def flush(self):
         if self.nbits:
@@ -138,20 +142,27 @@ class BitWriter:
             self.nbits = 0
         return bytes(self.out)
 
+class _Counter:
+    def __init__(self, freq: Dict[int, int]):
+        self.freq = freq
+    def __getitem__(self, symbol: int):
+        self.freq[symbol] += 1
+        return (0, 0)
+
 class SymbolCounter:
     def __init__(self):
         self.dc_freq: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
         self.ac_freq: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        self.tables: Dict[Tuple[int, int], _Counter] = {}
 
     def __getitem__(self, key: Tuple[int, int]):
-        table_class, table_id = key
-        freq = self.dc_freq[table_id] if table_class == 0 else self.ac_freq[table_id]
-
-        class Dummy:
-            def __getitem__(self, symbol: int):
-                freq[symbol] += 1
-                return (0, 0)
-        return Dummy()
+        table = self.tables.get(key)
+        if table is None:
+            table_class, table_id = key
+            freq = self.dc_freq[table_id] if table_class == 0 else self.ac_freq[table_id]
+            table = _Counter(freq)
+            self.tables[key] = table
+        return table
 
     def write(self, code: int, length: int):
         pass
@@ -488,7 +499,7 @@ def getEntropyData(image, lookup,
             return dict(counter.dc_freq), {}
         return bw.flush()
 
-    iter = getMCUs(image, components[0]) if len(components) == 1  else getMCUs(image)
+    iter = getMCUs(image, components[0]) if len(components) == 1 else getMCUs(image)
     if Ss == 0:
         pred = {c: 0 for c in components}
         for c, block in iter:
@@ -503,7 +514,7 @@ def getEntropyData(image, lookup,
         return dict(counter.dc_freq), dict(counter.ac_freq)
     return bw.flush()
 
-def getMCUs(image, component: Optional[str]=None):
+def getMCUs(image, component: Optional[str] = None):
     if component:
         c = next((c for c in image.components if c.name == component), None)
         if c is None:
